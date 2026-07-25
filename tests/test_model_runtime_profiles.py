@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import yaml
 
+from app.core.chat_controller import ChatController
 from app.core.config import load_config
 from app.core.model_runtime import ModelRuntime
 
@@ -115,4 +116,38 @@ def test_named_profiles_resident_and_swap(monkeypatch, tmp_path) -> None:
     )
     assert "orchestrator" not in runtime._chat_profiles
     assert "creator" in runtime._chat_profiles
+
+
+class _PlanShim(ChatController):
+    """ChatController without its heavy managers -- just config + runtime.
+
+    agent_load_plan and the throughput helpers only touch those two.
+    """
+
+    def __init__(self, config) -> None:  # noqa: D401 - deliberately skips super
+        self.config = config
+        self.runtime = ModelRuntime(config)
+
+
+def test_agent_load_plan_swap_planner_is_planner_only(tmp_path) -> None:
+    """A swap planner evicts the workers, so the plan is just the planner."""
+    config = load_config(_profile_config(tmp_path))
+    ctrl = _PlanShim(config)
+
+    plan = ctrl.agent_load_plan()
+
+    assert [name for name, _p, _s in plan] == ["orchestrator"]
+    assert all(size > 0 for _n, _p, size in plan)  # real file sizes
+
+
+def test_load_throughput_roundtrip_with_ema(tmp_path) -> None:
+    config = load_config(_profile_config(tmp_path))
+    config.agents.runs_path = str(tmp_path / "runs")  # keep stats out of the repo
+    ctrl = _PlanShim(config)
+
+    assert ctrl.estimated_load_bps() == 0.0  # nothing remembered yet
+    ctrl.record_load_bps(1000.0)
+    assert ctrl.estimated_load_bps() == 1000.0
+    ctrl.record_load_bps(2000.0)  # EMA: 0.5*1000 + 0.5*2000
+    assert abs(ctrl.estimated_load_bps() - 1500.0) < 1e-6
 

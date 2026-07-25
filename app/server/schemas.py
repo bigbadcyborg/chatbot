@@ -57,6 +57,17 @@ class AgentStateResponse(BaseModel):
     data: dict = {}
 
 
+class AgentLoadStateResponse(BaseModel):
+    loading: bool = False
+    done: bool = False
+    current: str = ""  # profile currently loading, e.g. "orchestrator"
+    loaded_bytes: int = 0
+    total_bytes: int = 0
+    elapsed_seconds: float = 0.0
+    eta_seconds: float = -1.0  # -1 = not yet estimable
+    message: str = ""
+
+
 class ShutdownResponse(BaseModel):
     stopping: bool
     message: str = ""

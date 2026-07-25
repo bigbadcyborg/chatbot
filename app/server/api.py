@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from typing import Any
 
 from fastapi import (
@@ -29,6 +30,7 @@ from starlette.concurrency import run_in_threadpool
 from app.core.chat_controller import ChatController
 from app.core.command_router import CommandRouter
 from app.server.schemas import (
+    AgentLoadStateResponse,
     AgentStartRequest,
     AgentStartResponse,
     AgentStateResponse,
@@ -198,6 +200,81 @@ def create_app(controller: ChatController, transcriber=None) -> FastAPI:
     # background thread and the GUI polls /api/agents/state — a single blocking
     # request would exceed any sane HTTP timeout.
     agent_state: dict = {"running": False, "stage": "", "result": ""}
+    # Load Agents is also long (a 40 GB planner load), so it runs in a thread
+    # and the GUI polls /api/agents/load-state to drive a progress bar. llama
+    # gives no sub-load progress, so the bar advances per model completed; the
+    # ETA comes from throughput remembered across loads.
+    load_state: dict = {
+        "loading": False,
+        "done": False,
+        "current": "",
+        "loaded_bytes": 0,
+        "total_bytes": 0,
+        "started_at": 0.0,
+        "message": "",
+    }
+
+    def _run_load_job() -> None:
+        plan = controller.agent_load_plan()
+        already = controller.runtime.loaded_profile_names()
+        sizes = {name: size for name, _path, size in plan}
+        # Only count what will actually load; residents already resident are free.
+        total = sum(size for name, _p, size in plan if name not in already)
+
+        # A single mutable holder so the listener closure can finalize the
+        # previous model's bytes when the next one starts loading.
+        cur = {"name": "", "size": 0}
+
+        def finalize_current() -> None:
+            if cur["name"]:
+                load_state["loaded_bytes"] = min(
+                    total, load_state["loaded_bytes"] + cur["size"]
+                )
+                cur["name"], cur["size"] = "", 0
+
+        def on_load(message: str) -> None:
+            # Messages: "Loading agent model 'X'...", "Loading chat model...".
+            name = ""
+            if "agent model '" in message:
+                name = message.split("agent model '", 1)[1].split("'", 1)[0]
+            elif "chat model" in message:
+                name = "default"
+            else:
+                return  # embedding model etc. -- not part of the agent load
+            finalize_current()  # the model that was loading has finished
+            cur["name"] = name
+            cur["size"] = sizes.get(name, 0)
+            load_state["current"] = name
+
+        previous_listener = controller.runtime._load_listener
+        controller.runtime.set_load_listener(on_load)
+        started = time.monotonic()
+        load_state.update(
+            {
+                "loading": True,
+                "done": False,
+                "current": "",
+                "loaded_bytes": 0,
+                "total_bytes": total,
+                "started_at": started,
+                "message": "Loading agent models…",
+            }
+        )
+        try:
+            summary = controller.preload_agent_models()
+            finalize_current()  # the last model has no "next" event to close it
+            load_state["message"] = summary
+            elapsed = time.monotonic() - started
+            if load_state["loaded_bytes"] > 0 and elapsed > 0:
+                controller.record_load_bps(load_state["loaded_bytes"] / elapsed)
+        except Exception as error:  # noqa: BLE001
+            load_state["message"] = f"Load failed: {error}"
+        finally:
+            controller.runtime.set_load_listener(previous_listener)
+            load_state["loaded_bytes"] = load_state["total_bytes"]
+            load_state["current"] = ""
+            load_state["loading"] = False
+            load_state["done"] = True
 
     def _run_agent_job(kind: str, goal: str, run_id: str) -> None:
         def progress(line: str) -> None:
@@ -260,6 +337,51 @@ def create_app(controller: ChatController, transcriber=None) -> FastAPI:
         data = await run_in_threadpool(controller.agents_data, "")
         return AgentStateResponse(
             running=running, stage=stage, result=result, data=data
+        )
+
+    @app.post(
+        "/api/agents/load",
+        response_model=AgentStartResponse,
+        dependencies=[Depends(auth)],
+    )
+    async def agents_load() -> AgentStartResponse:
+        if load_state["loading"]:
+            return AgentStartResponse(started=False, message="Already loading.")
+        if agent_state["running"]:
+            return AgentStartResponse(
+                started=False, message="An agent run is in progress."
+            )
+        # Flip the flags synchronously so a poll landing before the thread runs
+        # can't read a previous load's done=True and stop instantly.
+        load_state.update({"loading": True, "done": False})
+        threading.Thread(target=_run_load_job, daemon=True).start()
+        return AgentStartResponse(started=True, message="Loading agent models.")
+
+    @app.get(
+        "/api/agents/load-state",
+        response_model=AgentLoadStateResponse,
+        dependencies=[Depends(auth)],
+    )
+    async def agents_load_state() -> AgentLoadStateResponse:
+        loaded = load_state["loaded_bytes"]
+        total = load_state["total_bytes"]
+        started = load_state["started_at"]
+        elapsed = (time.monotonic() - started) if started else 0.0
+        remaining = max(0, total - loaded)
+        # ETA from the machine's remembered load throughput. The live rate is
+        # unusable here: bytes land in one lump per model, so a single large
+        # load reads as 0 B/s until it finishes.
+        bps = await run_in_threadpool(controller.estimated_load_bps)
+        eta = (remaining / bps) if (bps > 0 and load_state["loading"]) else -1.0
+        return AgentLoadStateResponse(
+            loading=load_state["loading"],
+            done=load_state["done"],
+            current=load_state["current"],
+            loaded_bytes=loaded,
+            total_bytes=total,
+            elapsed_seconds=elapsed,
+            eta_seconds=eta,
+            message=load_state["message"],
         )
 
     @app.post(

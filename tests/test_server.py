@@ -54,8 +54,13 @@ class FakeRuntime:
     def load_embedding_model(self):
         self.embed_loaded = True
 
+    _load_listener = None
+
     def set_load_listener(self, listener) -> None:
-        self._listener = listener
+        self._load_listener = listener
+
+    def loaded_profile_names(self) -> set:
+        return set()
 
 
 class FakeController:
@@ -250,7 +255,19 @@ class FakeController:
 
     def preload_agent_models(self, *, on_progress=None) -> str:
         self.preloaded = True
+        # Mimic the runtime firing a load message for the planner.
+        if self.runtime._load_listener:
+            self.runtime._load_listener("Loading agent model 'orchestrator'...")
         return "Planner profile 'orchestrator' loaded."
+
+    def agent_load_plan(self):
+        return [("orchestrator", "models/orchestrator.gguf", 1000)]
+
+    def estimated_load_bps(self) -> float:
+        return getattr(self, "_bps", 0.0)
+
+    def record_load_bps(self, bps: float) -> None:
+        self._bps = bps
 
     def curator_data(self) -> dict:
         return {"enabled": False, "findings": [], "active_skills": [], "archived_skills": []}
@@ -295,6 +312,36 @@ def test_agents_load_preloads_models(client: TestClient) -> None:
     r = client.post("/api/command", json={"name": "agents", "args": "load"})
     assert r.status_code == 200
     assert "orchestrator" in r.json()["text"]
+
+
+def test_agents_load_job_reports_progress_and_finishes() -> None:
+    """The async load drives load-state to done, with bytes accounted."""
+    import time as _time
+
+    controller = FakeController()
+    app = create_app(controller)
+    tc = TestClient(app)
+
+    start = tc.post("/api/agents/load")
+    assert start.json()["started"] is True
+
+    # The job runs on a daemon thread; poll until it reports done.
+    deadline = _time.time() + 5
+    state = {}
+    while _time.time() < deadline:
+        state = tc.get("/api/agents/load-state").json()
+        if state["done"]:
+            break
+        _time.sleep(0.02)
+
+    assert state["done"] is True
+    assert state["loading"] is False
+    # The plan's one 1000-byte model is fully accounted for at the end.
+    assert state["total_bytes"] == 1000
+    assert state["loaded_bytes"] == 1000
+    assert "orchestrator" in state["message"]
+    # A throughput sample was recorded for future ETAs.
+    assert controller._bps > 0
 
 
 def test_shutdown_replies_then_stops(monkeypatch: pytest.MonkeyPatch) -> None:

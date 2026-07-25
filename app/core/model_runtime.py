@@ -146,6 +146,15 @@ class ModelRuntime:
         with self._lock:
             self._load_chat_profile_unlocked(profile_name)
 
+    def profile_model_path(self, profile_name: str) -> Path:
+        """Public: the GGUF a profile loads from (its override, or the default)."""
+        return self._profile_model_path(self._normalize_profile_name(profile_name))
+
+    def loaded_profile_names(self) -> set[str]:
+        """Names of profiles with a model currently resident."""
+        with self._lock:
+            return set(self._chat_profiles)
+
     def profile_statuses(self) -> list[RuntimeProfileStatus]:
         """Return loaded/unloaded state for configured runtime profiles."""
         statuses = [

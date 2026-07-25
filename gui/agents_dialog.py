@@ -9,6 +9,7 @@ Requires PySide6 (Windows GUI venv).
 from __future__ import annotations
 
 import json
+import time
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
@@ -19,14 +20,25 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
 from gui.api_client import ApiClient
-from gui.streaming import CommandWorker
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Render a duration as M:SS (or H:MM:SS past an hour)."""
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 class AgentsDialog(QDialog):
@@ -35,13 +47,17 @@ class AgentsDialog(QDialog):
         self.client = client
         self.setWindowTitle("Multi-Agent Workflows")
         self.resize(720, 620)
-        self._workers: list = []
+        self._exec_started: float | None = None  # monotonic when tasks appeared
         self._build_ui()
         # Poll while a run is in progress: agent runs take minutes (model swaps
         # + many LLM calls), so they run server-side and we poll for progress.
         self._poll = QTimer(self)
         self._poll.setInterval(2000)
         self._poll.timeout.connect(self._poll_state)
+        # A separate, faster poll drives the model-load progress bar.
+        self._load_poll = QTimer(self)
+        self._load_poll.setInterval(700)
+        self._load_poll.timeout.connect(self._poll_load)
         self._refresh()
 
     def _build_ui(self) -> None:
@@ -68,6 +84,21 @@ class AgentsDialog(QDialog):
 
         self.status = QLabel("Run a goal, or select a saved run below.")
         layout.addWidget(self.status)
+
+        # Progress panel: shared by model loading and run execution (they never
+        # overlap). Hidden when idle.
+        self.progress_panel = QWidget()
+        pp = QVBoxLayout(self.progress_panel)
+        pp.setContentsMargins(0, 0, 0, 0)
+        self.progress_phase = QLabel("")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        self.progress_eta = QLabel("")
+        pp.addWidget(self.progress_phase)
+        pp.addWidget(self.progress_bar)
+        pp.addWidget(self.progress_eta)
+        self.progress_panel.hide()
+        layout.addWidget(self.progress_panel)
 
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Task / checkpoint", "Status"])
@@ -108,6 +139,25 @@ class AgentsDialog(QDialog):
         bottom.addWidget(close)
         layout.addLayout(bottom)
 
+    # -- progress panel ---------------------------------------------------
+
+    def _set_progress(
+        self, phase: str, fraction: float | None, eta_text: str
+    ) -> None:
+        """Show the panel. fraction None => indeterminate (marquee) bar."""
+        self.progress_phase.setText(phase)
+        if fraction is None:
+            self.progress_bar.setRange(0, 0)  # busy indicator
+        else:
+            self.progress_bar.setRange(0, 1000)
+            self.progress_bar.setValue(int(max(0.0, min(1.0, fraction)) * 1000))
+        self.progress_eta.setText(eta_text)
+        self.progress_panel.show()
+
+    def _hide_progress(self) -> None:
+        self.progress_bar.setRange(0, 1000)  # leave a determinate bar at rest
+        self.progress_panel.hide()
+
     def _refresh(self) -> None:
         try:
             state = self.client.agents_state()
@@ -141,9 +191,51 @@ class AgentsDialog(QDialog):
 
     def _apply_state(self, state: dict) -> None:
         data = state.get("data", {})
-        if state.get("running"):
+        running = bool(state.get("running"))
+        if running:
             self.status.setText(f"⏳ {state.get('stage') or 'running'}…")
-        self._render(data, running=bool(state.get("running")))
+        self._render(data, running=running)
+        self._update_run_progress(state, running)
+
+    def _update_run_progress(self, state: dict, running: bool) -> None:
+        """Drive the progress panel from task completion during a run."""
+        if not running:
+            # A model load owns the panel while it loads; don't fight it.
+            if not self._load_poll.isActive():
+                self._hide_progress()
+            self._exec_started = None
+            return
+
+        run = (state.get("data") or {}).get("current") or {}
+        tasks = run.get("tasks", [])
+        if not tasks:
+            # Planning: the planner (often the big swap model) is loading/plotting
+            # the graph, and there is nothing to measure yet.
+            self._exec_started = None
+            self._set_progress(
+                "Planning the task graph… (the planner model may be loading)",
+                None,
+                "Estimating time remaining…",
+            )
+            return
+
+        if self._exec_started is None:
+            self._exec_started = time.monotonic()
+        total = len(tasks)
+        passed = sum(1 for t in tasks if t.get("status") == "passed")
+        elapsed = time.monotonic() - self._exec_started
+        if passed >= 1:
+            per_task = elapsed / passed
+            eta = per_task * (total - passed)
+            eta_text = (
+                f"Elapsed {_fmt_duration(elapsed)} · "
+                f"~{_fmt_duration(eta)} left (estimate)"
+            )
+        else:
+            eta_text = f"Elapsed {_fmt_duration(elapsed)} · estimating…"
+        self._set_progress(
+            f"Running tasks — {passed}/{total} complete", passed / total, eta_text
+        )
 
     def _render(self, data: dict, running: bool = False) -> None:
         self.enabled_check.blockSignals(True)
@@ -190,26 +282,68 @@ class AgentsDialog(QDialog):
         self._refresh()
 
     def _load_models(self) -> None:
-        """Pay the model-load cost up front rather than inside the first run."""
+        """Pay the model-load cost up front rather than inside the first run.
+
+        The load runs server-side; we poll /api/agents/load-state to drive the
+        progress bar.
+        """
+        try:
+            resp = self.client.agents_load()
+        except Exception as error:  # noqa: BLE001
+            self.message.setText(f"Could not start load: {error}")
+            return
+        if not resp.get("started"):
+            self.message.setText(resp.get("message", "Could not start load."))
+            return
+        self.message.setText("")
         self.load_btn.setEnabled(False)
         self.run_btn.setEnabled(False)
-        self.status.setText("⏳ loading agent models… this can take a few minutes.")
-        worker = CommandWorker(self.client, "agents", "load")
-        worker.done.connect(lambda r: self.message.setText(r.get("text", "")))
-        worker.error.connect(lambda t: self.message.setText(f"Load failed: {t}"))
-        worker.finished.connect(lambda: self._load_finished(worker))
-        self._workers.append(worker)
-        worker.start()
+        self.status.setText("⏳ loading agent models…")
+        self._set_progress("Starting model load…", None, "Estimating…")
+        self._load_poll.start()
 
-    def _load_finished(self, worker) -> None:
-        self._drop(worker)
-        self.load_btn.setEnabled(True)
-        self.run_btn.setEnabled(True)
-        self.status.setText("Agent models loaded. Run a goal, or select a saved run below.")
+    def _poll_load(self) -> None:
+        try:
+            st = self.client.agents_load_state()
+        except Exception as error:  # noqa: BLE001
+            self.message.setText(f"Lost contact with server: {error}")
+            self._load_poll.stop()
+            self._hide_progress()
+            self.load_btn.setEnabled(True)
+            self.run_btn.setEnabled(True)
+            return
 
-    def _drop(self, worker) -> None:
-        if worker in self._workers:
-            self._workers.remove(worker)
+        loaded = st.get("loaded_bytes", 0)
+        total = st.get("total_bytes", 0)
+        elapsed = st.get("elapsed_seconds", 0.0)
+        eta = st.get("eta_seconds", -1.0)
+        current = st.get("current", "")
+
+        gb = 1024 ** 3
+        phase = (
+            f"Loading model: {current}…" if current else "Loading agent models…"
+        )
+        size_note = f"{loaded / gb:.1f} / {total / gb:.1f} GB" if total else ""
+        eta_note = (
+            f"~{_fmt_duration(eta)} left (estimate)" if eta >= 0 else "estimating…"
+        )
+        self._set_progress(
+            f"{phase}  {size_note}".strip(),
+            (loaded / total) if total else None,
+            f"Elapsed {_fmt_duration(elapsed)} · {eta_note}",
+        )
+
+        # Key completion on `done`, not `loading`: the load thread flips
+        # `loading` True a moment after the POST returns, so a first poll landing
+        # in that gap would read the initial loading=False and stop immediately.
+        # The job's finally block always sets done=True.
+        if st.get("done"):
+            self._load_poll.stop()
+            self._hide_progress()
+            self.load_btn.setEnabled(True)
+            self.run_btn.setEnabled(True)
+            self.message.setText(st.get("message", "Agent models loaded."))
+            self.status.setText("Agent models loaded. Run a goal, or select a saved run below.")
 
     def _run(self) -> None:
         goal = self.goal_edit.text().strip()
@@ -230,6 +364,12 @@ class AgentsDialog(QDialog):
         # Loading a profile mid-run would fight the run for the runtime lock and
         # could evict the models it is using.
         self.load_btn.setEnabled(False)
+        self._exec_started = None
+        self._set_progress(
+            "Planning the task graph… (the planner model may be loading)",
+            None,
+            "Estimating time remaining…",
+        )
         self._poll.start()
 
     def _selected_checkpoint(self) -> str:
@@ -329,6 +469,7 @@ class AgentsDialog(QDialog):
         self.status.setText("⏳ resuming…")
         self.run_btn.setEnabled(False)
         self.load_btn.setEnabled(False)
+        self._exec_started = None
         self._poll.start()
 
     def _cancel(self) -> None:
@@ -337,5 +478,7 @@ class AgentsDialog(QDialog):
         self._refresh()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
-        self._poll.stop()  # a run keeps going server-side; just stop polling
+        # A run or load keeps going server-side; just stop polling this dialog.
+        self._poll.stop()
+        self._load_poll.stop()
         super().closeEvent(event)

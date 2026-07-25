@@ -102,6 +102,16 @@ class ApiClient:
         resp.raise_for_status()
         return resp.json()
 
+    def agents_load(self) -> dict[str, Any]:
+        resp = self._http.post("/api/agents/load", headers=self._headers())
+        resp.raise_for_status()
+        return resp.json()
+
+    def agents_load_state(self) -> dict[str, Any]:
+        resp = self._http.get("/api/agents/load-state", headers=self._headers())
+        resp.raise_for_status()
+        return resp.json()
+
     def upload_doc(self, filename: str, content: bytes) -> dict[str, Any]:
         resp = self._http.post(
             "/api/rag/upload",

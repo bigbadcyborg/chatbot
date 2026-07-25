@@ -2106,6 +2106,78 @@ class ChatController:
             )
         return self.agent_manager.cancel_run(run_id)
 
+    def agent_planner_profile(self) -> str:
+        """Name of the profile the orchestrator plans with."""
+        role = self.config.agents.roles.get("orchestrator")
+        return role.model_profile if role else self.config.agents.default_profile
+
+    def agent_load_plan(self) -> list[tuple[str, "Path", int]]:
+        """Ordered profiles Load Agents will load, deduped by file, with sizes.
+
+        A swap planner evicts everything as it loads, so there is no point
+        warming the resident workers ahead of it -- the plan is just the
+        planner. Otherwise the residents load first, then the planner. Profiles
+        that share a GGUF appear once (they load a single shared instance).
+        """
+        from pathlib import Path  # local: keep module import surface small
+
+        planner = self.agent_planner_profile()
+        prof = self.config.agents.model_profiles.get(planner)
+        planner_swaps = prof is not None and prof.residency == "swap"
+
+        names: list[str] = []
+        if not planner_swaps and self.config.agents.residency_mode == "hybrid":
+            names.extend(
+                name
+                for name, profile in self.config.agents.model_profiles.items()
+                if profile.residency == "resident"
+            )
+        names.append(planner)
+
+        plan: list[tuple[str, Path, int]] = []
+        seen: set[str] = set()
+        for name in names:
+            path = self.runtime.profile_model_path(name)
+            if str(path) in seen:
+                continue
+            seen.add(str(path))
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            plan.append((name, path, size))
+        return plan
+
+    def _load_stats_path(self) -> "Path":
+        from pathlib import Path
+
+        return Path(self.config.agents.runs_dir) / ".load_stats.json"
+
+    def estimated_load_bps(self) -> float:
+        """Machine's remembered model-load throughput (bytes/sec), 0 if unknown."""
+        import json
+
+        try:
+            data = json.loads(self._load_stats_path().read_text())
+            return max(0.0, float(data.get("bytes_per_sec", 0.0)))
+        except Exception:  # noqa: BLE001 - absent/corrupt stats just mean "unknown"
+            return 0.0
+
+    def record_load_bps(self, bps: float) -> None:
+        """Fold a fresh throughput sample into the persisted estimate (EMA)."""
+        import json
+
+        if bps <= 0:
+            return
+        prev = self.estimated_load_bps()
+        blended = bps if prev <= 0 else 0.5 * prev + 0.5 * bps
+        try:
+            path = self._load_stats_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"bytes_per_sec": blended}))
+        except Exception:  # noqa: BLE001 - progress persistence is best-effort
+            pass
+
     def preload_agent_models(
         self, *, on_progress: Callable[[str], None] | None = None
     ) -> str:
@@ -2118,21 +2190,18 @@ class ChatController:
         them first would just throw the work away (the run re-warms them after
         planning, which is where they belong).
         """
-        role = self.config.agents.roles.get("orchestrator")
-        planner = (
-            role.model_profile if role else self.config.agents.default_profile
-        )
-        planner_swaps = (
-            self.config.agents.model_profiles.get(planner) is not None
-            and self.config.agents.model_profiles[planner].residency == "swap"
-        )
+        planner = self.agent_planner_profile()
+        prof = self.config.agents.model_profiles.get(planner)
+        planner_swaps = prof is not None and prof.residency == "swap"
 
         lines: list[str] = []
+        # Residents go through warm_resident_profiles (not itemized here) so its
+        # VRAM fallback is preserved; per-model progress comes from the runtime
+        # load listener, which fires for every real load either way.
         if not planner_swaps:
             if on_progress:
                 on_progress("Warming resident agent profiles…")
-            for warning in self.runtime.warm_resident_profiles():
-                lines.append(warning)
+            lines.extend(self.runtime.warm_resident_profiles())
 
         if on_progress:
             on_progress(f"Loading planner profile '{planner}'…")
